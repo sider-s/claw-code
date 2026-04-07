@@ -3777,7 +3777,8 @@ impl ApiClient for ProviderRuntimeClient {
             })
             .collect::<Vec<_>>();
         let messages = convert_messages(&request.messages);
-        let system = (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
+        let system =
+            (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
         let tool_choice = (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
 
         let runtime = &self.runtime;
@@ -5329,8 +5330,8 @@ mod tests {
         GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
         SubagentToolExecutor,
     };
-    use runtime::ProviderFallbackConfig;
     use api::OutputContentBlock;
+    use runtime::ProviderFallbackConfig;
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
         PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,

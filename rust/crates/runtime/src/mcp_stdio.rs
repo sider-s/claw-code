@@ -13,7 +13,9 @@ use tokio::time::timeout;
 
 use crate::config::{McpTransport, RuntimeConfig, ScopedMcpServerConfig};
 use crate::mcp::mcp_tool_name;
-use crate::mcp_client::{McpClientBootstrap, McpClientTransport, McpStdioTransport};
+use crate::mcp_client::{
+    McpClientBootstrap, McpClientTransport, McpStdioTransport, DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS,
+};
 use crate::mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase,
 };
@@ -462,7 +464,7 @@ struct ToolRoute {
 #[derive(Debug)]
 struct ManagedMcpServer {
     bootstrap: McpClientBootstrap,
-    process: Option<McpStdioProcess>,
+    process: Option<McpProcess>,
     initialized: bool,
 }
 
@@ -496,18 +498,21 @@ impl McpServerManager {
         let mut unsupported_servers = Vec::new();
 
         for (server_name, server_config) in servers {
-            if server_config.transport() == McpTransport::Stdio {
-                let bootstrap = McpClientBootstrap::from_scoped_config(server_name, server_config);
-                managed_servers.insert(server_name.clone(), ManagedMcpServer::new(bootstrap));
-            } else {
-                unsupported_servers.push(UnsupportedMcpServer {
-                    server_name: server_name.clone(),
-                    transport: server_config.transport(),
-                    reason: format!(
-                        "transport {:?} is not supported by McpServerManager",
-                        server_config.transport()
-                    ),
-                });
+            match server_config.transport() {
+                McpTransport::Stdio | McpTransport::Http | McpTransport::Sse => {
+                    let bootstrap =
+                        McpClientBootstrap::from_scoped_config(server_name, server_config);
+                    managed_servers.insert(server_name.clone(), ManagedMcpServer::new(bootstrap));
+                }
+                other => {
+                    unsupported_servers.push(UnsupportedMcpServer {
+                        server_name: server_name.clone(),
+                        transport: other,
+                        reason: format!(
+                            "transport {other:?} is not supported by McpServerManager",
+                        ),
+                    });
+                }
             }
         }
 
@@ -764,10 +769,13 @@ impl McpServerManager {
                 })?;
         match &server.bootstrap.transport {
             McpClientTransport::Stdio(transport) => Ok(transport.resolved_tool_call_timeout_ms()),
+            McpClientTransport::Http(_) | McpClientTransport::Sse(_) => {
+                Ok(DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS)
+            }
             other => Err(McpServerManagerError::InvalidResponse {
                 server_name: server_name.to_string(),
                 method: "tools/call",
-                details: format!("unsupported MCP transport for stdio manager: {other:?}"),
+                details: format!("unsupported MCP transport for manager: {other:?}"),
             }),
         }
     }
@@ -1064,7 +1072,7 @@ impl McpServerManager {
 
             if needs_spawn {
                 let server = self.server_mut(server_name)?;
-                server.process = Some(spawn_mcp_stdio_process(&server.bootstrap)?);
+                server.process = Some(spawn_mcp_process(&server.bootstrap)?);
                 server.initialized = false;
             }
 
@@ -1365,6 +1373,221 @@ impl McpStdioProcess {
         }
         let _ = self.child.wait().await?;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP MCP transport
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub struct McpHttpProcess {
+    client: reqwest::Client,
+    url: String,
+    headers: BTreeMap<String, String>,
+}
+
+impl McpHttpProcess {
+    pub fn new(url: String, headers: BTreeMap<String, String>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            url,
+            headers,
+        }
+    }
+
+    async fn request<TParams: Serialize, TResult: DeserializeOwned>(
+        &self,
+        id: JsonRpcId,
+        method: impl Into<String>,
+        params: Option<TParams>,
+    ) -> io::Result<JsonRpcResponse<TResult>> {
+        let request = JsonRpcRequest::new(id.clone(), method.into(), params);
+        let body = serde_json::to_vec(&request)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        let mut req_builder = self
+            .client
+            .post(&self.url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(body);
+
+        for (key, value) in &self.headers {
+            req_builder = req_builder.header(key.as_str(), value.as_str());
+        }
+
+        let http_response = req_builder
+            .send()
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))?;
+
+        if !http_response.status().is_success() {
+            let status = http_response.status();
+            let text = http_response.text().await.unwrap_or_else(|_| String::new());
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("HTTP MCP {status}: {text}"),
+            ));
+        }
+
+        let response_bytes = http_response
+            .bytes()
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
+
+        serde_json::from_slice::<JsonRpcResponse<TResult>>(&response_bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    pub async fn initialize(
+        &self,
+        id: JsonRpcId,
+        params: McpInitializeParams,
+    ) -> io::Result<JsonRpcResponse<McpInitializeResult>> {
+        self.request(id, "initialize", Some(params)).await
+    }
+
+    pub async fn list_tools(
+        &self,
+        id: JsonRpcId,
+        params: Option<McpListToolsParams>,
+    ) -> io::Result<JsonRpcResponse<McpListToolsResult>> {
+        self.request(id, "tools/list", params).await
+    }
+
+    pub async fn call_tool(
+        &self,
+        id: JsonRpcId,
+        params: McpToolCallParams,
+    ) -> io::Result<JsonRpcResponse<McpToolCallResult>> {
+        self.request(id, "tools/call", Some(params)).await
+    }
+
+    pub async fn list_resources(
+        &self,
+        id: JsonRpcId,
+        params: Option<McpListResourcesParams>,
+    ) -> io::Result<JsonRpcResponse<McpListResourcesResult>> {
+        self.request(id, "resources/list", params).await
+    }
+
+    pub async fn read_resource(
+        &self,
+        id: JsonRpcId,
+        params: McpReadResourceParams,
+    ) -> io::Result<JsonRpcResponse<McpReadResourceResult>> {
+        self.request(id, "resources/read", Some(params)).await
+    }
+
+    pub fn has_exited(&self) -> io::Result<bool> {
+        Ok(false)
+    }
+
+    pub async fn shutdown(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unified process enum
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub enum McpProcess {
+    Stdio(McpStdioProcess),
+    Http(McpHttpProcess),
+}
+
+impl McpProcess {
+    pub async fn initialize(
+        &mut self,
+        id: JsonRpcId,
+        params: McpInitializeParams,
+    ) -> io::Result<JsonRpcResponse<McpInitializeResult>> {
+        match self {
+            Self::Stdio(p) => p.initialize(id, params).await,
+            Self::Http(p) => p.initialize(id, params).await,
+        }
+    }
+
+    pub async fn list_tools(
+        &mut self,
+        id: JsonRpcId,
+        params: Option<McpListToolsParams>,
+    ) -> io::Result<JsonRpcResponse<McpListToolsResult>> {
+        match self {
+            Self::Stdio(p) => p.list_tools(id, params).await,
+            Self::Http(p) => p.list_tools(id, params).await,
+        }
+    }
+
+    pub async fn call_tool(
+        &mut self,
+        id: JsonRpcId,
+        params: McpToolCallParams,
+    ) -> io::Result<JsonRpcResponse<McpToolCallResult>> {
+        match self {
+            Self::Stdio(p) => p.call_tool(id, params).await,
+            Self::Http(p) => p.call_tool(id, params).await,
+        }
+    }
+
+    pub async fn list_resources(
+        &mut self,
+        id: JsonRpcId,
+        params: Option<McpListResourcesParams>,
+    ) -> io::Result<JsonRpcResponse<McpListResourcesResult>> {
+        match self {
+            Self::Stdio(p) => p.list_resources(id, params).await,
+            Self::Http(p) => p.list_resources(id, params).await,
+        }
+    }
+
+    pub async fn read_resource(
+        &mut self,
+        id: JsonRpcId,
+        params: McpReadResourceParams,
+    ) -> io::Result<JsonRpcResponse<McpReadResourceResult>> {
+        match self {
+            Self::Stdio(p) => p.read_resource(id, params).await,
+            Self::Http(p) => p.read_resource(id, params).await,
+        }
+    }
+
+    pub fn has_exited(&mut self) -> io::Result<bool> {
+        match self {
+            Self::Stdio(p) => p.has_exited(),
+            Self::Http(p) => p.has_exited(),
+        }
+    }
+
+    pub async fn shutdown(&mut self) -> io::Result<()> {
+        match self {
+            Self::Stdio(p) => p.shutdown().await,
+            Self::Http(p) => p.shutdown().await,
+        }
+    }
+}
+
+fn spawn_mcp_process(bootstrap: &McpClientBootstrap) -> io::Result<McpProcess> {
+    match &bootstrap.transport {
+        McpClientTransport::Stdio(transport) => {
+            McpStdioProcess::spawn(transport).map(McpProcess::Stdio)
+        }
+        McpClientTransport::Http(transport) | McpClientTransport::Sse(transport) => {
+            Ok(McpProcess::Http(McpHttpProcess::new(
+                transport.url.clone(),
+                transport.headers.clone(),
+            )))
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "MCP transport for {} is not supported: {other:?}",
+                bootstrap.server_name
+            ),
+        )),
     }
 }
 

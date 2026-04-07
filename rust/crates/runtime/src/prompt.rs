@@ -739,8 +739,16 @@ mod tests {
             .render();
 
         // then: branch, recent commits and staged files are present in context
-        let gc = context.git_context.as_ref().expect("git context should be present");
-        let commits: String = gc.recent_commits.iter().map(|c| c.subject.clone()).collect::<Vec<_>>().join("\n");
+        let gc = context
+            .git_context
+            .as_ref()
+            .expect("git context should be present");
+        let commits: String = gc
+            .recent_commits
+            .iter()
+            .map(|c| c.subject.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(commits.contains("first commit"));
         assert!(commits.contains("second commit"));
         assert!(commits.contains("third commit"));

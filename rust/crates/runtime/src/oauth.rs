@@ -298,6 +298,178 @@ pub fn clear_oauth_credentials() -> io::Result<()> {
     write_credentials_root(&path, &root)
 }
 
+// ---------------------------------------------------------------------------
+// Codex (OpenAI) OAuth credential storage
+// ---------------------------------------------------------------------------
+
+/// Persisted Codex OAuth credential bundle stored under `"codex_oauth"` in
+/// `credentials.json`. Includes the `account_id` extracted from the JWT.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexOAuthTokenSet {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_at: Option<u64>,
+    pub account_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredCodexOAuthCredentials {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_at: Option<u64>,
+    #[serde(default)]
+    account_id: Option<String>,
+}
+
+impl From<CodexOAuthTokenSet> for StoredCodexOAuthCredentials {
+    fn from(value: CodexOAuthTokenSet) -> Self {
+        Self {
+            access_token: value.access_token,
+            refresh_token: value.refresh_token,
+            expires_at: value.expires_at,
+            account_id: value.account_id,
+        }
+    }
+}
+
+impl From<StoredCodexOAuthCredentials> for CodexOAuthTokenSet {
+    fn from(value: StoredCodexOAuthCredentials) -> Self {
+        Self {
+            access_token: value.access_token,
+            refresh_token: value.refresh_token,
+            expires_at: value.expires_at,
+            account_id: value.account_id,
+        }
+    }
+}
+
+pub fn load_codex_oauth_credentials() -> io::Result<Option<CodexOAuthTokenSet>> {
+    let path = credentials_path()?;
+    let root = read_credentials_root(&path)?;
+    let Some(codex) = root.get("codex_oauth") else {
+        return Ok(None);
+    };
+    if codex.is_null() {
+        return Ok(None);
+    }
+    let stored = serde_json::from_value::<StoredCodexOAuthCredentials>(codex.clone())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(Some(stored.into()))
+}
+
+pub fn save_codex_oauth_credentials(token_set: &CodexOAuthTokenSet) -> io::Result<()> {
+    let path = credentials_path()?;
+    let mut root = read_credentials_root(&path)?;
+    root.insert(
+        "codex_oauth".to_string(),
+        serde_json::to_value(StoredCodexOAuthCredentials::from(token_set.clone()))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+    );
+    write_credentials_root(&path, &root)
+}
+
+pub fn clear_codex_oauth_credentials() -> io::Result<()> {
+    let path = credentials_path()?;
+    let mut root = read_credentials_root(&path)?;
+    root.remove("codex_oauth");
+    write_credentials_root(&path, &root)
+}
+
+/// Extract the `chatgpt_account_id` from a Codex OAuth JWT access token.
+///
+/// The JWT payload contains a claim at `https://api.openai.com/auth` with a
+/// nested `chatgpt_account_id` field. Returns `None` on any parse failure.
+#[must_use]
+pub fn extract_codex_account_id(access_token: &str) -> Option<String> {
+    let parts: Vec<&str> = access_token.split('.').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    // JWT uses standard base64 (not base64url in practice for this field),
+    // but OpenAI tokens use base64url encoding. We decode with padding
+    // tolerance.
+    let decoded = base64url_decode(parts[1]).ok()?;
+    let payload: Value = serde_json::from_slice(&decoded).ok()?;
+    payload
+        .get("https://api.openai.com/auth")?
+        .get("chatgpt_account_id")?
+        .as_str()
+        .map(ToString::to_string)
+}
+
+/// Default Codex (`OpenAI`) OAuth configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexOAuthConfig {
+    pub client_id: String,
+    pub authorize_url: String,
+    pub token_url: String,
+    pub callback_port: u16,
+    pub scopes: String,
+}
+
+impl Default for CodexOAuthConfig {
+    fn default() -> Self {
+        Self {
+            client_id: String::from("app_EMoamEEZ73f0CkXaXp7hrann"),
+            authorize_url: String::from("https://auth.openai.com/oauth/authorize"),
+            token_url: String::from("https://auth.openai.com/oauth/token"),
+            callback_port: 1455,
+            scopes: String::from("openid profile email offline_access"),
+        }
+    }
+}
+
+/// Build the authorization URL for Codex OAuth with PKCE + extra parameters.
+#[must_use]
+pub fn codex_authorize_url(
+    config: &CodexOAuthConfig,
+    redirect_uri: &str,
+    state: &str,
+    pkce: &PkceCodePair,
+) -> String {
+    let params = vec![
+        ("response_type", "code".to_string()),
+        ("client_id", config.client_id.clone()),
+        ("redirect_uri", redirect_uri.to_string()),
+        ("scope", config.scopes.clone()),
+        ("state", state.to_string()),
+        ("code_challenge", pkce.challenge.clone()),
+        (
+            "code_challenge_method",
+            pkce.challenge_method.as_str().to_string(),
+        ),
+        ("id_token_add_organizations", "true".to_string()),
+        ("codex_cli_simplified_flow", "true".to_string()),
+        ("originator", "claw".to_string()),
+    ];
+    let query = params
+        .into_iter()
+        .map(|(key, value)| format!("{}={}", percent_encode(key), percent_encode(&value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{}?{}", config.authorize_url, query)
+}
+
+/// Codex callback uses `/auth/callback` instead of `/callback`.
+#[must_use]
+pub fn codex_loopback_redirect_uri(port: u16) -> String {
+    format!("http://localhost:{port}/auth/callback")
+}
+
+/// Parse a Codex OAuth callback request target (path = `/auth/callback`).
+pub fn parse_codex_callback_request_target(target: &str) -> Result<OAuthCallbackParams, String> {
+    let (path, query) = target
+        .split_once('?')
+        .map_or((target, ""), |(path, query)| (path, query));
+    if path != "/auth/callback" {
+        return Err(format!("unexpected codex callback path: {path}"));
+    }
+    parse_oauth_callback_query(query)
+}
+
 pub fn parse_oauth_callback_request_target(target: &str) -> Result<OAuthCallbackParams, String> {
     let (path, query) = target
         .split_once('?')
@@ -401,6 +573,42 @@ fn base64url_encode(bytes: &[u8]) -> String {
         _ => {}
     }
     output
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn base64url_decode(input: &str) -> Result<Vec<u8>, String> {
+    const DECODE: [u8; 128] = {
+        let mut table = [0xFF_u8; 128];
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut i = 0;
+        while i < 64 {
+            table[alphabet[i] as usize] = i as u8;
+            i += 1;
+        }
+        // Accept standard base64 `+` and `/` as well.
+        table[b'+' as usize] = 62;
+        table[b'/' as usize] = 63;
+        table
+    };
+
+    let trimmed = input.trim_end_matches('=');
+    let bytes = trimmed.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len() * 3 / 4 + 1);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+    for &byte in bytes {
+        if byte >= 128 || DECODE[byte as usize] == 0xFF {
+            return Err(format!("invalid base64url byte: {byte}"));
+        }
+        buf = (buf << 6) | u32::from(DECODE[byte as usize]);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Ok(output)
 }
 
 fn percent_encode(value: &str) -> String {

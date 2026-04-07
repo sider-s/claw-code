@@ -1,6 +1,7 @@
 use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
+use crate::providers::codex::{self, CodexClient};
 use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
 use crate::providers::{self, ProviderKind};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
@@ -11,6 +12,7 @@ pub enum ProviderClient {
     Anthropic(AnthropicClient),
     Xai(OpenAiCompatClient),
     OpenAi(OpenAiCompatClient),
+    Codex(CodexClient),
 }
 
 impl ProviderClient {
@@ -34,6 +36,15 @@ impl ProviderClient {
             ProviderKind::OpenAi => Ok(Self::OpenAi(OpenAiCompatClient::from_env(
                 OpenAiCompatConfig::openai(),
             )?)),
+            ProviderKind::Codex => {
+                let creds = codex::load_codex_auth().ok_or_else(|| {
+                    ApiError::missing_credentials("Codex (OpenAI)", &["OPENAI_API_KEY"])
+                })?;
+                Ok(Self::Codex(CodexClient::new(
+                    creds.access_token,
+                    creds.account_id.unwrap_or_default(),
+                )))
+            }
         }
     }
 
@@ -43,6 +54,7 @@ impl ProviderClient {
             Self::Anthropic(_) => ProviderKind::Anthropic,
             Self::Xai(_) => ProviderKind::Xai,
             Self::OpenAi(_) => ProviderKind::OpenAi,
+            Self::Codex(_) => ProviderKind::Codex,
         }
     }
 
@@ -58,7 +70,7 @@ impl ProviderClient {
     pub fn prompt_cache_stats(&self) -> Option<PromptCacheStats> {
         match self {
             Self::Anthropic(client) => client.prompt_cache_stats(),
-            Self::Xai(_) | Self::OpenAi(_) => None,
+            Self::Xai(_) | Self::OpenAi(_) | Self::Codex(_) => None,
         }
     }
 
@@ -66,7 +78,7 @@ impl ProviderClient {
     pub fn take_last_prompt_cache_record(&self) -> Option<PromptCacheRecord> {
         match self {
             Self::Anthropic(client) => client.take_last_prompt_cache_record(),
-            Self::Xai(_) | Self::OpenAi(_) => None,
+            Self::Xai(_) | Self::OpenAi(_) | Self::Codex(_) => None,
         }
     }
 
@@ -77,6 +89,7 @@ impl ProviderClient {
         match self {
             Self::Anthropic(client) => client.send_message(request).await,
             Self::Xai(client) | Self::OpenAi(client) => client.send_message(request).await,
+            Self::Codex(client) => client.send_message(request).await,
         }
     }
 
@@ -93,6 +106,10 @@ impl ProviderClient {
                 .stream_message(request)
                 .await
                 .map(MessageStream::OpenAiCompat),
+            Self::Codex(client) => client
+                .stream_message(request)
+                .await
+                .map(MessageStream::Codex),
         }
     }
 }
@@ -101,6 +118,7 @@ impl ProviderClient {
 pub enum MessageStream {
     Anthropic(anthropic::MessageStream),
     OpenAiCompat(openai_compat::MessageStream),
+    Codex(codex::MessageStream),
 }
 
 impl MessageStream {
@@ -109,6 +127,7 @@ impl MessageStream {
         match self {
             Self::Anthropic(stream) => stream.request_id(),
             Self::OpenAiCompat(stream) => stream.request_id(),
+            Self::Codex(stream) => stream.request_id(),
         }
     }
 
@@ -116,6 +135,7 @@ impl MessageStream {
         match self {
             Self::Anthropic(stream) => stream.next_event().await,
             Self::OpenAiCompat(stream) => stream.next_event().await,
+            Self::Codex(stream) => stream.next_event().await,
         }
     }
 }

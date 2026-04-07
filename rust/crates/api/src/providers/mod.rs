@@ -8,6 +8,7 @@ use crate::error::ApiError;
 use crate::types::{MessageRequest, MessageResponse};
 
 pub mod anthropic;
+pub mod codex;
 pub mod openai_compat;
 
 #[allow(dead_code)]
@@ -33,6 +34,7 @@ pub enum ProviderKind {
     Anthropic,
     Xai,
     OpenAi,
+    Codex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +124,33 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
         },
     ),
+    (
+        "gpt-5.4",
+        ProviderMetadata {
+            provider: ProviderKind::Codex,
+            auth_env: "OPENAI_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: codex::CODEX_API_URL,
+        },
+    ),
+    (
+        "gpt-4.1",
+        ProviderMetadata {
+            provider: ProviderKind::Codex,
+            auth_env: "OPENAI_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: codex::CODEX_API_URL,
+        },
+    ),
+    (
+        "gpt-4.1-mini",
+        ProviderMetadata {
+            provider: ProviderKind::Codex,
+            auth_env: "OPENAI_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: codex::CODEX_API_URL,
+        },
+    ),
 ];
 
 #[must_use]
@@ -144,7 +173,7 @@ pub fn resolve_model_alias(model: &str) -> String {
                     "grok-2" => "grok-2",
                     _ => trimmed,
                 },
-                ProviderKind::OpenAi => trimmed,
+                ProviderKind::OpenAi | ProviderKind::Codex => trimmed,
             })
         })
         .map_or_else(|| trimmed.to_string(), ToOwned::to_owned)
@@ -169,6 +198,14 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
         });
     }
+    if canonical.starts_with("gpt-") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::Codex,
+            auth_env: "OPENAI_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: codex::CODEX_API_URL,
+        });
+    }
     None
 }
 
@@ -179,6 +216,9 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     }
     if anthropic::has_auth_from_env_or_saved().unwrap_or(false) {
         return ProviderKind::Anthropic;
+    }
+    if codex::has_codex_auth() {
+        return ProviderKind::Codex;
     }
     if openai_compat::has_api_key("OPENAI_API_KEY") {
         return ProviderKind::OpenAi;
@@ -227,6 +267,14 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
         "grok-3" | "grok-3-mini" => Some(ModelTokenLimit {
             max_output_tokens: 64_000,
             context_window_tokens: 131_072,
+        }),
+        "gpt-5.4" => Some(ModelTokenLimit {
+            max_output_tokens: 64_000,
+            context_window_tokens: 1_048_576,
+        }),
+        "gpt-4.1" | "gpt-4.1-mini" => Some(ModelTokenLimit {
+            max_output_tokens: 32_768,
+            context_window_tokens: 1_048_576,
         }),
         _ => None,
     }

@@ -26,8 +26,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use api::{
     detect_provider_kind, oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient,
     AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
-    MessageResponse, OutputContentBlock, PromptCache, ProviderKind, StreamEvent as ApiStreamEvent,
-    ToolChoice, ToolDefinition, ToolResultContentBlock,
+    MessageResponse, OutputContentBlock, PromptCache, ProviderClient, ProviderKind,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -42,19 +42,23 @@ use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    check_base_commit, clear_oauth_credentials, format_stale_base_warning, format_usd,
+    check_base_commit, clear_codex_oauth_credentials, clear_oauth_credentials, codex_authorize_url,
+    codex_loopback_redirect_uri, extract_codex_account_id, format_stale_base_warning, format_usd,
     generate_pkce_pair, generate_state, load_oauth_credentials, load_system_prompt,
-    parse_oauth_callback_request_target, pricing_for_model, resolve_expected_base,
-    resolve_sandbox_status, save_oauth_credentials, ApiClient, ApiRequest, AssistantEvent,
-    CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
-    ConversationRuntime, McpServer, McpServerManager, McpServerSpec, McpTool, MessageRole,
-    ModelPricing, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
+    parse_codex_callback_request_target, parse_oauth_callback_request_target, pricing_for_model,
+    resolve_expected_base, resolve_sandbox_status, save_codex_oauth_credentials,
+    save_oauth_credentials, ApiClient, ApiRequest, AssistantEvent, CodexOAuthConfig,
+    CodexOAuthTokenSet, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
+    ConversationMessage, ConversationRuntime, McpServer, McpServerManager, McpServerSpec, McpTool,
+    MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest,
     PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode,
     RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use tools::{execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
+use tools::{
+    execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
+};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
@@ -205,11 +209,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             run_stale_base_preflight(base_commit.as_deref());
             let stdin_context = read_piped_stdin();
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-            LiveCli::new(model, true, allowed_tools, permission_mode)?
-                .run_turn_with_output(&effective_prompt, output_format, false)?;
+            LiveCli::new(model, true, allowed_tools, permission_mode)?.run_turn_with_output(
+                &effective_prompt,
+                output_format,
+                false,
+            )?;
         }
-        CliAction::Login { output_format } => run_login(output_format)?,
-        CliAction::Logout { output_format } => run_logout(output_format)?,
+        CliAction::Login {
+            output_format,
+            provider,
+        } => match provider {
+            LoginProvider::Anthropic => run_login(output_format)?,
+            LoginProvider::Codex => run_codex_login(output_format)?,
+        },
+        CliAction::Logout {
+            output_format,
+            provider,
+        } => match provider {
+            LoginProvider::Anthropic => run_logout(output_format)?,
+            LoginProvider::Codex => run_codex_logout(output_format)?,
+        },
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
         CliAction::Export {
@@ -286,9 +305,11 @@ enum CliAction {
     },
     Login {
         output_format: CliOutputFormat,
+        provider: LoginProvider,
     },
     Logout {
         output_format: CliOutputFormat,
+        provider: LoginProvider,
     },
     Doctor {
         output_format: CliOutputFormat,
@@ -334,6 +355,24 @@ impl CliOutputFormat {
             "json" => Ok(Self::Json),
             other => Err(format!(
                 "unsupported value for --output-format: {other} (expected text or json)"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginProvider {
+    Anthropic,
+    Codex,
+}
+
+impl LoginProvider {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.to_ascii_lowercase().as_str() {
+            "anthropic" | "claude" => Ok(Self::Anthropic),
+            "codex" | "openai" => Ok(Self::Codex),
+            other => Err(format!(
+                "unsupported value for --provider: {other} (expected anthropic or codex)"
             )),
         }
     }
@@ -533,8 +572,20 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
         }
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
-        "login" => Ok(CliAction::Login { output_format }),
-        "logout" => Ok(CliAction::Logout { output_format }),
+        "login" => {
+            let provider = parse_provider_from_args(&rest[1..], output_format)?;
+            Ok(CliAction::Login {
+                output_format,
+                provider,
+            })
+        }
+        "logout" => {
+            let provider = parse_provider_from_args(&rest[1..], output_format)?;
+            Ok(CliAction::Logout {
+                output_format,
+                provider,
+            })
+        }
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
@@ -937,11 +988,7 @@ fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
 fn config_model_for_current_dir() -> Option<String> {
     let cwd = env::current_dir().ok()?;
     let loader = ConfigLoader::default_for(&cwd);
-    loader
-        .load()
-        .ok()?
-        .model()
-        .map(ToOwned::to_owned)
+    loader.load().ok()?.model().map(ToOwned::to_owned)
 }
 
 fn resolve_repl_model(cli_model: String) -> String {
@@ -966,6 +1013,7 @@ fn provider_label(kind: ProviderKind) -> &'static str {
         ProviderKind::Anthropic => "anthropic",
         ProviderKind::Xai => "xai",
         ProviderKind::OpenAi => "openai",
+        ProviderKind::Codex => "codex",
     }
 }
 
@@ -979,6 +1027,31 @@ fn filter_tool_specs(
     allowed_tools: Option<&AllowedToolSet>,
 ) -> Vec<ToolDefinition> {
     tool_registry.definitions(allowed_tools)
+}
+
+fn parse_provider_from_args(
+    args: &[String],
+    _output_format: CliOutputFormat,
+) -> Result<LoginProvider, String> {
+    let mut provider = LoginProvider::Anthropic;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--provider" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --provider".to_string())?;
+                provider = LoginProvider::parse(value)?;
+                index += 2;
+            }
+            flag if flag.starts_with("--provider=") => {
+                provider = LoginProvider::parse(&flag[11..])?;
+                index += 1;
+            }
+            other => return Err(format!("unexpected argument for login/logout: {other}")),
+        }
+    }
+    Ok(provider)
 }
 
 fn parse_system_prompt_args(
@@ -1016,10 +1089,7 @@ fn parse_system_prompt_args(
     })
 }
 
-fn parse_export_args(
-    args: &[String],
-    output_format: CliOutputFormat,
-) -> Result<CliAction, String> {
+fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
     let mut session_reference = LATEST_SESSION_REFERENCE.to_string();
     let mut output_path: Option<PathBuf> = None;
     let mut index = 0;
@@ -1934,6 +2004,200 @@ fn run_logout(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+fn run_codex_login(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let codex_config = CodexOAuthConfig::default();
+    let callback_port = codex_config.callback_port;
+    let redirect_uri = codex_loopback_redirect_uri(callback_port);
+    let pkce = generate_pkce_pair()?;
+    let state = generate_state()?;
+    let authorize_url = codex_authorize_url(&codex_config, &redirect_uri, &state, &pkce);
+
+    if output_format == CliOutputFormat::Text {
+        println!("Starting Codex (OpenAI) OAuth login...");
+        println!("Listening for callback on {redirect_uri}");
+    }
+    if let Err(error) = open_browser(&authorize_url) {
+        emit_login_browser_open_failure(
+            output_format,
+            &authorize_url,
+            &error,
+            &mut io::stdout(),
+            &mut io::stderr(),
+        )?;
+    }
+
+    let callback = wait_for_codex_oauth_callback(callback_port)?;
+    if let Some(error) = callback.error {
+        let description = callback
+            .error_description
+            .unwrap_or_else(|| "authorization failed".to_string());
+        return Err(io::Error::other(format!("{error}: {description}")).into());
+    }
+    let code = callback.code.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "callback did not include code")
+    })?;
+    let returned_state = callback.state.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "callback did not include state")
+    })?;
+    if returned_state != state {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "oauth state mismatch").into());
+    }
+
+    // Exchange code for tokens — Codex uses JSON body, not form-encoded.
+    let runtime_handle = tokio::runtime::Runtime::new()?;
+    let token_set = runtime_handle.block_on(exchange_codex_oauth_code(
+        &codex_config,
+        &code,
+        &redirect_uri,
+        &pkce.verifier,
+    ))?;
+
+    let account_id = extract_codex_account_id(&token_set.access_token);
+
+    let expires_at = token_set.expires_in.map(|seconds| {
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + seconds
+    });
+
+    save_codex_oauth_credentials(&CodexOAuthTokenSet {
+        access_token: token_set.access_token,
+        refresh_token: token_set.refresh_token,
+        expires_at,
+        account_id,
+    })?;
+
+    match output_format {
+        CliOutputFormat::Text => println!("Codex (OpenAI) OAuth login complete."),
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "login",
+                "provider": "codex",
+                "callback_port": callback_port,
+                "redirect_uri": redirect_uri,
+                "message": "Codex (OpenAI) OAuth login complete.",
+            }))?
+        ),
+    }
+    Ok(())
+}
+
+/// Raw token response from the OpenAI OAuth token endpoint.
+#[derive(Debug, Deserialize)]
+struct CodexTokenResponse {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_in: Option<u64>,
+}
+
+async fn exchange_codex_oauth_code(
+    config: &CodexOAuthConfig,
+    code: &str,
+    redirect_uri: &str,
+    code_verifier: &str,
+) -> Result<CodexTokenResponse, Box<dyn std::error::Error>> {
+    let client = api::build_http_client_or_default();
+    let response = client
+        .post(&config.token_url)
+        .header("content-type", "application/json")
+        .json(&json!({
+            "grant_type": "authorization_code",
+            "client_id": config.client_id,
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "code_verifier": code_verifier,
+        }))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(
+            io::Error::other(format!("Codex token exchange failed ({status}): {body}")).into(),
+        );
+    }
+    let token_response: CodexTokenResponse = response.json().await?;
+    Ok(token_response)
+}
+
+async fn refresh_codex_oauth_token(
+    config: &CodexOAuthConfig,
+    refresh_token: &str,
+) -> Result<CodexTokenResponse, Box<dyn std::error::Error>> {
+    let client = api::build_http_client_or_default();
+    let response = client
+        .post(&config.token_url)
+        .header("content-type", "application/json")
+        .json(&json!({
+            "grant_type": "refresh_token",
+            "client_id": config.client_id,
+            "refresh_token": refresh_token,
+        }))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(
+            io::Error::other(format!("Codex token refresh failed ({status}): {body}")).into(),
+        );
+    }
+    let token_response: CodexTokenResponse = response.json().await?;
+    Ok(token_response)
+}
+
+fn run_codex_logout(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    clear_codex_oauth_credentials()?;
+    match output_format {
+        CliOutputFormat::Text => println!("Codex (OpenAI) OAuth credentials cleared."),
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "logout",
+                "provider": "codex",
+                "message": "Codex (OpenAI) OAuth credentials cleared.",
+            }))?
+        ),
+    }
+    Ok(())
+}
+
+fn wait_for_codex_oauth_callback(
+    port: u16,
+) -> Result<runtime::OAuthCallbackParams, Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    let (mut stream, _) = listener.accept()?;
+    let mut buffer = [0_u8; 4096];
+    let bytes_read = stream.read(&mut buffer)?;
+    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+    let request_line = request.lines().next().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "missing callback request line")
+    })?;
+    let target = request_line.split_whitespace().nth(1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing callback request target",
+        )
+    })?;
+    let callback = parse_codex_callback_request_target(target)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let body = if callback.error.is_some() {
+        "Codex OAuth login failed. You can close this window."
+    } else {
+        "Codex OAuth login succeeded. You can close this window."
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(response.as_bytes())?;
+    Ok(callback)
+}
+
 fn open_browser(url: &str) -> io::Result<()> {
     let commands = if cfg!(target_os = "macos") {
         vec![("open", vec![url])]
@@ -2629,7 +2893,8 @@ fn run_resume_command(
             json: None,
         }),
         SlashCommand::History { count } => {
-            let limit = parse_history_count(count.as_deref()).map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+            let limit = parse_history_count(count.as_deref())
+                .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
             let entries = collect_session_prompt_history(session);
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
@@ -2748,7 +3013,9 @@ fn run_repl(
                 }
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
-                cli.run_turn(&trimmed)?;
+                if let Err(error) = cli.run_turn(&trimmed) {
+                    eprintln!("\nerror: {error}\n");
+                }
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -5300,16 +5567,18 @@ fn format_history_timestamp(timestamp_ms: u64) -> String {
     let seconds = seconds_of_day % 60;
 
     let (year, month, day) = civil_from_days(i64::try_from(days_since_epoch).unwrap_or(0));
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{subsec_ms:03}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{subsec_ms:03}Z")
 }
 
 // Computes civil (Gregorian) year/month/day from days since the Unix epoch
 // (1970-01-01) using Howard Hinnant's `civil_from_days` algorithm.
 fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let z = days + 719_468;
-    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
     let doe = (z - era * 146_097) as u64; // [0, 146_096]
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
     let y = yoe as i64 + era * 400;
@@ -6265,7 +6534,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: AnthropicClient,
+    client: ProviderClient,
     session_id: String,
     model: String,
     enable_tools: bool,
@@ -6285,11 +6554,10 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let client = build_provider_client_for_model(&model, session_id)?;
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url())
-                .with_prompt_cache(PromptCache::new(session_id)),
+            client,
             session_id: session_id.to_string(),
             model,
             enable_tools,
@@ -6298,6 +6566,25 @@ impl AnthropicRuntimeClient {
             tool_registry,
             progress_reporter,
         })
+    }
+}
+
+fn build_provider_client_for_model(
+    model: &str,
+    session_id: &str,
+) -> Result<ProviderClient, Box<dyn std::error::Error>> {
+    let kind = detect_provider_kind(model);
+    match kind {
+        ProviderKind::Codex => {
+            // Codex models use OAuth credentials, not Anthropic auth.
+            Ok(ProviderClient::from_model(model)?)
+        }
+        _ => {
+            // Anthropic / Xai / OpenAI — try Anthropic auth for Anthropic models.
+            let auth = resolve_cli_auth_source().ok();
+            Ok(ProviderClient::from_model_with_anthropic_auth(model, auth)?
+                .with_prompt_cache(PromptCache::new(session_id)))
+        }
     }
 }
 
@@ -6359,7 +6646,10 @@ impl ApiClient for AnthropicRuntimeClient {
                     .await;
                 match result {
                     Ok(events) => return Ok(events),
-                    Err(error) if error.to_string().contains("post-tool stall") && attempt < max_attempts => {
+                    Err(error)
+                        if error.to_string().contains("post-tool stall")
+                            && attempt < max_attempts =>
+                    {
                         // Stalled after tool completion — nudge the model by
                         // re-sending the same request.
                         continue;
@@ -6368,9 +6658,7 @@ impl ApiClient for AnthropicRuntimeClient {
                 }
             }
 
-            Err(RuntimeError::new(
-                "post-tool continuation nudge exhausted",
-            ))
+            Err(RuntimeError::new("post-tool continuation nudge exhausted"))
         })
     }
 }
@@ -6384,13 +6672,13 @@ impl AnthropicRuntimeClient {
         message_request: &MessageRequest,
         apply_stall_timeout: bool,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let mut stream =
-            self.client
-                .stream_message(message_request)
-                .await
-                .map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                })?;
+        let mut stream = self
+            .client
+            .stream_message(message_request)
+            .await
+            .map_err(|error| {
+                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+            })?;
         let mut stdout = io::stdout();
         let mut sink = io::sink();
         let out: &mut dyn Write = if self.emit_output {
@@ -6410,10 +6698,7 @@ impl AnthropicRuntimeClient {
             let next = if apply_stall_timeout && !received_any_event {
                 match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
                     Ok(inner) => inner.map_err(|error| {
-                        RuntimeError::new(format_user_visible_api_error(
-                            &self.session_id,
-                            &error,
-                        ))
+                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
                     })?,
                     Err(_elapsed) => {
                         return Err(RuntimeError::new(
@@ -6510,6 +6795,12 @@ impl AnthropicRuntimeClient {
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                     }
+                    // Ensure cursor is on a fresh line so that the spinner
+                    // clear (`MoveToColumn(0)` + `Clear(CurrentLine)`) does
+                    // not overwrite the last line of model output.
+                    writeln!(out)
+                        .and_then(|()| out.flush())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
                     events.push(AssistantEvent::MessageStop);
                 }
             }
@@ -6597,9 +6888,15 @@ fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) 
             context_window_tokens,
         } => {
             lines.push(format!("  Model            {model}"));
-            lines.push(format!("  Input estimate   ~{estimated_input_tokens} tokens (heuristic)"));
-            lines.push(format!("  Requested output {requested_output_tokens} tokens"));
-            lines.push(format!("  Total estimate   ~{estimated_total_tokens} tokens (heuristic)"));
+            lines.push(format!(
+                "  Input estimate   ~{estimated_input_tokens} tokens (heuristic)"
+            ));
+            lines.push(format!(
+                "  Requested output {requested_output_tokens} tokens"
+            ));
+            lines.push(format!(
+                "  Total estimate   ~{estimated_total_tokens} tokens (heuristic)"
+            ));
             lines.push(format!("  Context window   {context_window_tokens} tokens"));
         }
         api::ApiError::Api { message, body, .. } => {
@@ -6746,6 +7043,9 @@ fn slash_command_completion_candidates_with_sessions(
         "/model opus",
         "/model sonnet",
         "/model haiku",
+        "/model gpt-5.4",
+        "/model gpt-4.1",
+        "/model gpt-4.1-mini",
         "/permissions ",
         "/permissions read-only",
         "/permissions workspace-write",
@@ -7314,7 +7614,7 @@ fn response_to_events(
     Ok(events)
 }
 
-fn push_prompt_cache_record(client: &AnthropicClient, events: &mut Vec<AssistantEvent>) {
+fn push_prompt_cache_record(client: &ProviderClient, events: &mut Vec<AssistantEvent>) {
     if let Some(record) = client.take_last_prompt_cache_record() {
         if let Some(event) = prompt_cache_record_to_runtime_event(record) {
             events.push(AssistantEvent::PromptCache(event));
@@ -7572,7 +7872,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw login")?;
     writeln!(out, "  claw logout")?;
     writeln!(out, "  claw init")?;
-    writeln!(out, "  claw export [PATH] [--session SESSION] [--output PATH]")?;
+    writeln!(
+        out,
+        "  claw export [PATH] [--session SESSION] [--output PATH]"
+    )?;
     writeln!(
         out,
         "      Dump the latest (or named) session as markdown; writes to PATH or stdout"
@@ -7637,10 +7940,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  claw --output-format json prompt \"explain src/main.rs\""
     )?;
-    writeln!(
-        out,
-        "  claw --compact \"summarize Cargo.toml\" | wc -l"
-    )?;
+    writeln!(out, "  claw --compact \"summarize Cargo.toml\" | wc -l")?;
     writeln!(
         out,
         "  claw --allowedTools read,glob \"summarize Cargo.toml\""
@@ -7691,18 +7991,19 @@ mod tests {
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
         format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_git_status_branch,
-        parse_git_status_metadata_for, parse_git_workspace_summary, permission_policy,
-        print_help_to, push_output_block, render_config_report, render_diff_report,
-        render_diff_report_for, render_memory_report, render_repl_help, render_resume_usage,
-        resolve_model_alias, resolve_model_alias_with_config, resolve_repl_model,
-        resolve_session_reference, response_to_events, resume_supported_slash_commands,
-        run_resume_command, slash_command_completion_candidates_with_sessions, status_context,
-        validate_no_args, write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor,
-        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
-        LocalHelpTopic, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
-        PromptHistoryEntry, render_prompt_history_report, parse_history_count,
-        parse_export_args, render_session_markdown, summarize_tool_payload_for_markdown, short_tool_id,
+        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
+        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
+        parse_history_count, permission_policy, print_help_to, push_output_block,
+        render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
+        render_prompt_history_report, render_repl_help, render_resume_usage,
+        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
+        resolve_repl_model, resolve_session_reference, response_to_events,
+        resume_supported_slash_commands, run_resume_command, short_tool_id,
+        slash_command_completion_candidates_with_sessions, status_context,
+        summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture, CliAction,
+        CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
+        InternalPromptProgressState, LiveCli, LocalHelpTopic, LoginProvider, PromptHistoryEntry,
+        SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -8533,12 +8834,14 @@ mod tests {
             parse_args(&["login".to_string()]).expect("login should parse"),
             CliAction::Login {
                 output_format: CliOutputFormat::Text,
+                provider: LoginProvider::Anthropic,
             }
         );
         assert_eq!(
             parse_args(&["logout".to_string()]).expect("logout should parse"),
             CliAction::Logout {
                 output_format: CliOutputFormat::Text,
+                provider: LoginProvider::Anthropic,
             }
         );
         assert_eq!(
@@ -9372,8 +9675,7 @@ mod tests {
         std::env::remove_var("ANTHROPIC_MODEL");
         std::env::set_var("ANTHROPIC_MODEL", "sonnet");
 
-        let resolved =
-            with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
+        let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
 
         assert_eq!(resolved, "claude-sonnet-4-6");
 
@@ -9392,8 +9694,7 @@ mod tests {
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_MODEL");
 
-        let resolved =
-            with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
+        let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
 
         assert_eq!(resolved, DEFAULT_MODEL);
 
