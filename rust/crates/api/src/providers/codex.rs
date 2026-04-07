@@ -71,7 +71,7 @@ impl CodexClient {
         // For non-streaming, we stream internally and collect.
         let mut stream = self.stream_message(request).await?;
         let mut text_content = String::new();
-        let mut tool_uses: Vec<OutputContentBlock> = Vec::new();
+        let mut tool_uses: Vec<(String, String, String)> = Vec::new(); // (id, name, json_args)
         let mut usage = Usage::default();
 
         while let Some(event) = stream.next_event().await? {
@@ -79,13 +79,8 @@ impl CodexClient {
                 StreamEvent::ContentBlockDelta(delta_event) => match delta_event.delta {
                     ContentBlockDelta::TextDelta { text } => text_content.push_str(&text),
                     ContentBlockDelta::InputJsonDelta { partial_json } => {
-                        // Append to the last tool_use arguments
-                        if let Some(OutputContentBlock::ToolUse { input, .. }) =
-                            tool_uses.last_mut()
-                        {
-                            if let Some(existing) = input.as_str() {
-                                *input = Value::String(format!("{existing}{partial_json}"));
-                            }
+                        if let Some((_, _, args)) = tool_uses.last_mut() {
+                            args.push_str(&partial_json);
                         }
                     }
                     _ => {}
@@ -94,33 +89,30 @@ impl CodexClient {
                     usage = delta_event.usage;
                 }
                 StreamEvent::ContentBlockStart(start_event) => {
-                    if matches!(
-                        start_event.content_block,
-                        OutputContentBlock::ToolUse { .. }
-                    ) {
-                        tool_uses.push(start_event.content_block);
+                    if let OutputContentBlock::ToolUse { id, name, .. } = start_event.content_block
+                    {
+                        tool_uses.push((id, name, String::new()));
                     }
                 }
                 _ => {}
             }
         }
 
-        // Finalize tool use inputs (parse JSON strings into Values)
-        for block in &mut tool_uses {
-            if let OutputContentBlock::ToolUse { input, .. } = block {
-                if let Some(json_str) = input.as_str() {
-                    if let Ok(parsed) = serde_json::from_str(json_str) {
-                        *input = parsed;
-                    }
-                }
-            }
-        }
+        // Build finalized tool use blocks
+        let tool_blocks: Vec<OutputContentBlock> = tool_uses
+            .into_iter()
+            .map(|(id, name, args)| {
+                let input =
+                    serde_json::from_str(&args).unwrap_or(Value::Object(serde_json::Map::new()));
+                OutputContentBlock::ToolUse { id, name, input }
+            })
+            .collect();
 
         let mut content: Vec<OutputContentBlock> = Vec::new();
         if !text_content.is_empty() {
             content.push(OutputContentBlock::Text { text: text_content });
         }
-        content.extend(tool_uses);
+        content.extend(tool_blocks);
 
         let stop_reason = if content
             .iter()
@@ -251,30 +243,48 @@ fn convert_messages(messages: &[InputMessage], system: Option<&str>) -> (String,
                 }
             }
             "assistant" => {
-                let mut parts: Vec<Value> = Vec::new();
+                // Text content goes in a message; function_call is a
+                // separate top-level input item (not nested in content).
+                let mut text_parts: Vec<Value> = Vec::new();
                 for block in &msg.content {
                     match block {
                         InputContentBlock::Text { text } => {
-                            parts.push(json!({ "type": "output_text", "text": text }));
+                            text_parts.push(json!({ "type": "output_text", "text": text }));
                         }
                         InputContentBlock::ToolUse {
-                            id, name, input, ..
+                            id,
+                            name,
+                            input: tool_input,
+                            ..
                         } => {
-                            parts.push(json!({
+                            // Emit assistant text collected so far as a message
+                            // before the function_call item.
+                            if !text_parts.is_empty() {
+                                input.push(json!({
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": std::mem::take(&mut text_parts)
+                                }));
+                            }
+                            input.push(json!({
                                 "type": "function_call",
-                                "id": id,
+                                "call_id": id,
                                 "name": name,
-                                "arguments": if input.is_string() { input.as_str().unwrap_or("{}").to_string() } else { input.to_string() }
+                                "arguments": if tool_input.is_string() {
+                                    tool_input.as_str().unwrap_or("{}").to_string()
+                                } else {
+                                    tool_input.to_string()
+                                }
                             }));
                         }
                         _ => {}
                     }
                 }
-                if !parts.is_empty() {
+                if !text_parts.is_empty() {
                     input.push(json!({
                         "type": "message",
                         "role": "assistant",
-                        "content": parts
+                        "content": text_parts
                     }));
                 }
             }
@@ -516,7 +526,7 @@ impl MessageStream {
                             content_block: OutputContentBlock::ToolUse {
                                 id: call_id,
                                 name,
-                                input: Value::String(String::new()),
+                                input: Value::Object(serde_json::Map::new()),
                             },
                         },
                     ));
