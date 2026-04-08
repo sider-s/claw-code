@@ -319,6 +319,10 @@ where
                 return Err(error);
             }
 
+            if self.hook_abort_signal.is_aborted() {
+                break;
+            }
+
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
                 messages: self.session.messages.clone(),
@@ -368,6 +372,21 @@ where
             }
 
             for (tool_use_id, tool_name, input) in pending_tool_uses {
+                if self.hook_abort_signal.is_aborted() {
+                    // User pressed Ctrl+C — record a synthetic error result
+                    // for the remaining tool calls so the session stays valid.
+                    let abort_msg = ConversationMessage::tool_result(
+                        tool_use_id,
+                        tool_name,
+                        "Interrupted by user".to_string(),
+                        true,
+                    );
+                    self.session
+                        .push_message(abort_msg.clone())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    tool_results.push(abort_msg);
+                    continue;
+                }
                 let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
                 let effective_input = pre_hook_result
                     .updated_input()
@@ -708,7 +727,12 @@ fn build_assistant_message(
         ));
     }
     if blocks.is_empty() {
-        return Err(RuntimeError::new("assistant stream produced no content"));
+        // May happen when the user interrupts (Ctrl+C) before any content
+        // arrives, or the upstream model returns an empty response.  Treat
+        // as an empty assistant turn so the session remains valid.
+        blocks.push(ContentBlock::Text {
+            text: String::new(),
+        });
     }
 
     Ok((

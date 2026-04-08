@@ -6707,9 +6707,28 @@ impl AnthropicRuntimeClient {
                     }
                 }
             } else {
-                stream.next_event().await.map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                })?
+                // Race between next stream event and Ctrl+C so the user can
+                // interrupt long-running responses (especially over HTTP).
+                tokio::select! {
+                    biased;
+                    _ = tokio::signal::ctrl_c() => {
+                        // Drop the stream and return whatever we collected.
+                        drop(stream);
+                        if let Some(rendered) = markdown_stream.flush(&renderer) {
+                            let _ = write!(out, "{rendered}");
+                            let _ = out.flush();
+                        }
+                        let _ = writeln!(out);
+                        let _ = out.flush();
+                        events.push(AssistantEvent::MessageStop);
+                        return Ok(events);
+                    }
+                    result = stream.next_event() => {
+                        result.map_err(|error| {
+                            RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                        })?
+                    }
+                }
             };
 
             let Some(event) = next else {

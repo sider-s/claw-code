@@ -6,3 +6,4 @@ archive/
 .claude/settings.local.json
 .claude/sessions/
 rust/.claw/
+.clawd-todos.json
